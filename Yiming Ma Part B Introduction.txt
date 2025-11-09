@@ -1,0 +1,12 @@
+Example of Previous Work: Developing a Data-Driven Platform for Sustainable Solvent Selection
+
+Motivation:
+During a collaborative project with industrial partners, we identified the need for a user-friendly and data-driven platform that could support sustainable solvent selection in pharmaceutical crystallization. Industrial users required a practical tool to balance process efficiency, environmental performance, and regulatory compliance — all while ensuring that proprietary models and datasets remained protected.
+
+What I Did:
+I led the development of SolECOs (Solution ECOsystems), a modular decision-support platform integrating machine learning and sustainability assessment. Working with cross-disciplinary teams, we built a large-scale solubility dataset of over 1,100 APIs and 30 solvents, ensuring data consistency across multiple sources. Recognizing the multi-task and multi-objective nature of the problem, I implemented thermodynamically informed multi-task learning models (PRMMT, PAPN, MJANN) to predict solubility profiles and associated uncertainties.
+
+To make the system accessible to non-expert users, I developed an intuitive graphical interface and a protected deployment workflow that allowed collaborators to run predictions and solvent assessments without exposing underlying model parameters or source code.
+
+Outcome and Impact:
+The platform enabled faster and more transparent solvent screening, reducing experimental screening time by over 50% and supporting joint industry–academia projects. This work demonstrated how data science and chemical engineering can be effectively combined to drive sustainable digital transformation in process development.
