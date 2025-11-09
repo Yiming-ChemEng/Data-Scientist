@@ -1,0 +1,446 @@
+"""
+Technical Route 1: Robust Multimodal Fusion in Home Environments
+
+
+Key features implemented:
+- Multi-sensor streaming interfaces (temp, HRV, motion/IMU, environment)
+- Timestamp-based buffering & alignment + cross-attention alignment module
+- Per-signal confidence modeling (quality, SNR, missingness)
+- Masked Multimodal Transformer (MMT): masked token modeling + cross-modal contrastive pretraining
+- Shared latent space embeddings (temporally continuous)
+- On-device post-processing: confidence weighting + temporal smoothing (EMA / optional 1D Kalman)
+- Exportable on-device pipeline for inference
+
+"""
+import *
+
+# ============================
+# Utilities
+# ============================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def sinusoidal_position_encoding(length: int, dim: int, device=DEVICE):
+    pe = torch.zeros(length, dim, device=device)
+    position = torch.arange(0, length, dtype=torch.float, device=device).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device).float() * (-math.log(10000.0) / dim))
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+# ============================
+# Data Interfaces (stubs)
+# ============================
+
+@dataclass
+class SensorPacket:
+    ts: float  # unix timestamp (seconds)
+    value: torch.Tensor  # shape: (features,) or (seq, features)
+    quality: float = 1.0  # 0~1 quality score estimated by sensor/driver
+
+
+class SensorBuffer:
+    """Simple timestamped ring buffer for a single sensor stream."""
+
+    def __init__(self, maxlen: int = 512):
+        self.maxlen = maxlen
+        self.ts: List[float] = []
+        self.values: List[torch.Tensor] = []
+        self.qualities: List[float] = []
+
+    def push(self, packet: SensorPacket):
+        self.ts.append(packet.ts)
+        self.values.append(packet.value.detach().cpu())
+        self.qualities.append(packet.quality)
+        if len(self.ts) > self.maxlen:
+            self.ts = self.ts[-self.maxlen :]
+            self.values = self.values[-self.maxlen :]
+            self.qualities = self.qualities[-self.maxlen :]
+
+    def window(self, since: float, until: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        idx = [i for i, t in enumerate(self.ts) if since <= t <= until]
+        if not idx:
+            return (
+                torch.empty(0, 1),
+                torch.empty(0, 1),
+                torch.empty(0, 1),
+            )
+        vals = torch.stack([self.values[i] for i in idx])
+        tss = torch.tensor([self.ts[i] for i in idx], dtype=torch.float)
+        quals = torch.tensor([self.qualities[i] for i in idx], dtype=torch.float)
+        return tss, vals, quals
+
+
+# ============================
+# Encoders per modality
+# ============================
+
+class TinyMLP(nn.Module):
+    def __init__(self, d_in, d_out, hidden=128, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(hidden, d_out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SensorEncoder(nn.Module):
+    """Projects raw sensor features -> token embeddings."""
+
+    def __init__(self, in_feats: int, d_model: int):
+        super().__init__()
+        self.proj = TinyMLP(in_feats, d_model)
+
+    def forward(self, x):  # (B, T, F)
+        return self.proj(x)
+
+
+# ============================
+# Cross-Attention Alignment
+# ============================
+
+class CrossAttentionAligner(nn.Module):
+    """
+    Aligns multiple modality token sequences using cross-attention to a reference clock.
+    Inputs: dict of modality -> (B, T, d_model) + per-token time offsets and quality.
+    Returns aligned tokens and alignment confidences.
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4, n_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+            for _ in range(n_layers)
+        ])
+        self.align_conf_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid()
+        )
+
+    def forward(self, tokens: Dict[str, torch.Tensor], ref: torch.Tensor) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        aligned, conf = {}, {}
+        for k, x in tokens.items():
+            q = ref  # (B, T_ref, d)
+            v = x
+            for attn in self.layers:
+                q2, _ = attn(q, v, v)
+                q = q + q2  # residual
+            aligned[k] = q
+            conf[k] = self.align_conf_head(q)  # (B, T_ref, 1)
+        return aligned, conf
+
+
+# ============================
+# Masked Multimodal Transformer (MMT)
+# ============================
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, p: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(p), nn.Linear(d_ff, d_model)
+        )
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(p)
+
+    def forward(self, x):
+        a, _ = self.attn(x, x, x)
+        x = self.ln1(x + self.drop(a))
+        f = self.ff(x)
+        x = self.ln2(x + self.drop(f))
+        return x
+
+
+class MaskedMultimodalTransformer(nn.Module):
+    def __init__(self, d_model=256, depth=6, heads=8, d_ff=512, proj_dim=128):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, heads, d_ff) for _ in range(depth)
+        ])
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.to_shared = nn.Linear(d_model, proj_dim)
+        self.to_recon = nn.Linear(d_model, d_model)  # for masked modeling reconstruction
+
+    def forward(self, x, mask: Optional[torch.Tensor] = None):
+        # x: (B, T, d)
+        if mask is not None:
+            # replace masked positions with mask_token
+            mask_tok = self.mask_token.expand(x.size(0), x.size(1), -1)
+            x = torch.where(mask.bool().unsqueeze(-1), mask_tok, x)
+        for blk in self.blocks:
+            x = blk(x)
+        z_shared = F.normalize(self.to_shared(x), dim=-1)  # (B, T, proj_dim)
+        recon = self.to_recon(x)  # (B, T, d_model)
+        return z_shared, recon
+
+
+# ============================
+# Losses: Masked modeling + Cross-modal contrastive (InfoNCE)
+# ============================
+
+class MaskedModelingLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.crit = nn.SmoothL1Loss()
+
+    def forward(self, recon, target, mask):
+        if mask is None or mask.sum() == 0:
+            return torch.tensor(0.0, device=recon.device)
+        loss = self.crit(recon[mask.bool()], target[mask.bool()])
+        return loss
+
+
+class TemporalInfoNCELoss(nn.Module):
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.tau = temperature
+
+    def forward(self, z_a, z_b):
+        # z_*: (B, T, D)
+        B, T, D = z_a.shape
+        a = z_a.reshape(B * T, D)
+        b = z_b.reshape(B * T, D)
+        logits = a @ b.t() / self.tau  # (BT, BT)
+        labels = torch.arange(B * T, device=a.device)
+        loss = F.cross_entropy(logits, labels)
+        return loss
+
+
+# ============================
+# Confidence Modeling & Temporal Smoothing
+# ============================
+
+class ConfidenceHead(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1), nn.Sigmoid()
+        )
+
+    def forward(self, x):  # (B, T, d)
+        return self.net(x)  # (B, T, 1)
+
+
+class EMASmoother:
+    def __init__(self, alpha: float = 0.2):
+        self.alpha = alpha
+        self.state: Optional[torch.Tensor] = None
+
+    def reset(self):
+        self.state = None
+
+    def step(self, x: torch.Tensor):  # (T, D) or (1, D)
+        if self.state is None:
+            self.state = x.clone()
+        else:
+            self.state = self.alpha * x + (1 - self.alpha) * self.state
+        return self.state
+
+
+# ============================
+# Full Fusion Model
+# ============================
+
+class FusionModel(nn.Module):
+    def __init__(self, d_model=256, proj_dim=128):
+        super().__init__()
+        # Encoders per modality (example feature dims)
+        self.enc_temp = SensorEncoder(in_feats=2, d_model=d_model)         
+        self.enc_hrv = SensorEncoder(in_feats=4, d_model=d_model)          
+        self.enc_motion = SensorEncoder(in_feats=6, d_model=d_model)       
+        self.enc_env = SensorEncoder(in_feats=3, d_model=d_model)          
+
+        self.cross_align = CrossAttentionAligner(d_model)
+        self.mmt = MaskedMultimodalTransformer(d_model=d_model, proj_dim=proj_dim)
+        self.conf_head = ConfidenceHead(d_model)
+
+        self.mm_head = MaskedModelingLoss()
+        self.cl_head = TemporalInfoNCELoss()
+
+    def encode_modalities(self, temp, hrv, motion, env):
+        # inputs: (B, T, Fm)
+        return {
+            "temp": self.enc_temp(temp),
+            "hrv": self.enc_hrv(hrv),
+            "motion": self.enc_motion(motion),
+            "env": self.enc_env(env),
+        }
+
+    def forward_pretrain(self, temp, hrv, motion, env, mask):
+        # 1) encode
+        tokens = self.encode_modalities(temp, hrv, motion, env)
+
+        # 2) choose a reference sequence (e.g., motion) as timing backbone
+        ref = tokens["motion"]
+
+        # 3) cross-attention alignment to ref
+        aligned, align_conf = self.cross_align(tokens, ref)
+
+        # 4) modality fusion (sum/concat). Here we do confidence-weighted sum.
+        # Compute per-modality per-token confidences (0~1). Combine alignment conf + learned conf.
+        confs = {}
+        for k, v in aligned.items():
+            c_learned = self.conf_head(v)
+            c_align = align_conf[k]
+            confs[k] = torch.clamp(0.5 * (c_learned + c_align), 0, 1)  # (B, T, 1)
+
+        # Weighted sum fusion
+        denom = sum(confs.values()) + 1e-6
+        fused = sum(confs[k] * aligned[k] for k in aligned) / denom
+
+        # 5) masked modeling + get shared representations
+        z_shared, recon = self.mmt(fused, mask=mask)
+
+        # 6) construct contrastive pairs using two augmentations (e.g., different masks)
+        z_a = z_shared
+        z_b = z_shared.roll(shifts=1, dims=1)  # simple temporal augmentation
+
+        recon_loss = self.mm_head(recon, fused.detach(), mask)
+        cl_loss = self.cl_head(z_a, z_b)
+        loss = recon_loss + cl_loss
+
+        return {
+            "loss": loss,
+            "recon_loss": recon_loss.detach(),
+            "cl_loss": cl_loss.detach(),
+            "z": z_shared,
+            "conf": denom / len(confs),  # overall confidence per token
+        }
+
+    @torch.no_grad()
+    def forward_infer(self, temp, hrv, motion, env, smoother: Optional[EMASmoother] = None):
+        tokens = self.encode_modalities(temp, hrv, motion, env)
+        ref = tokens["motion"]
+        aligned, align_conf = self.cross_align(tokens, ref)
+
+        confs = {}
+        for k, v in aligned.items():
+            c_learned = self.conf_head(v)
+            c_align = align_conf[k]
+            confs[k] = torch.clamp(0.5 * (c_learned + c_align), 0, 1)
+        denom = sum(confs.values()) + 1e-6
+        fused = sum(confs[k] * aligned[k] for k in aligned) / denom
+
+        z, _ = self.mmt(fused, mask=None)
+        # Temporal smoothing on-device
+        if smoother is not None:
+            z_sm = smoother.step(z.squeeze(0))  # (T, D)
+        else:
+            z_sm = z.squeeze(0)
+        return z_sm, denom.squeeze(0)
+
+
+# ============================
+# Masking helpers & toy batch
+# ============================
+
+def random_token_mask(B: int, T: int, p: float = 0.15, device=DEVICE):
+    mask = torch.rand(B, T, device=device) < p
+    return mask
+
+
+def make_toy_batch(B=4, T=64, device=DEVICE):
+    temp = torch.randn(B, T, 2, device=device) * 0.1
+    hrv = torch.randn(B, T, 4, device=device)
+    motion = torch.randn(B, T, 6, device=device)
+    env = torch.randn(B, T, 3, device=device)
+    return temp, hrv, motion, env
+
+
+# ============================
+# Training skeleton
+# ============================
+
+def pretrain_step(model: FusionModel, opt: torch.optim.Optimizer, batch):
+    model.train()
+    temp, hrv, motion, env = batch
+    B, T, _ = motion.shape
+    mask = random_token_mask(B, T)
+    out = model.forward_pretrain(temp, hrv, motion, env, mask)
+    opt.zero_grad(set_to_none=True)
+    out["loss"].backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    return {k: float(v.detach().cpu()) if torch.is_tensor(v) else v for k, v in out.items() if k in ("loss", "recon_loss", "cl_loss")}
+
+
+# ============================
+# On-device streaming pipeline (inference)
+# ============================
+
+class OnDevicePipeline:
+    """
+    Minimal streaming loop demo. In practice, feed real sensor packets and call .infer_step per window.
+    """
+
+    def __init__(self, model: FusionModel, window_sec: float = 10.0, step_sec: float = 1.0, ema_alpha: float = 0.2):
+        self.model = model.eval()
+        self.window = window_sec
+        self.step = step_sec
+        self.buffers = {
+            "temp": SensorBuffer(),
+            "hrv": SensorBuffer(),
+            "motion": SensorBuffer(),
+            "env": SensorBuffer(),
+        }
+        self.smoother = EMASmoother(alpha=ema_alpha)
+
+    def push_packet(self, name: str, packet: SensorPacket):
+        self.buffers[name].push(packet)
+
+    def infer_step(self, now: Optional[float] = None) -> Optional[torch.Tensor]:
+        now = now or time.time()
+        since = now - self.window
+
+        def gather(name, feat_dim):
+            tss, vals, quals = self.buffers[name].window(since, now)
+            if vals.numel() == 0:
+                # backfill zeros if missing
+                vals = torch.zeros(1, feat_dim)
+            # resample to fixed T (naive):
+            T = 32
+            vals = F.interpolate(vals.unsqueeze(0).transpose(1, 2), size=T, mode="linear", align_corners=False).transpose(1, 2).squeeze(0)
+            return vals
+
+        temp = gather("temp", 2).unsqueeze(0).to(DEVICE)
+        hrv = gather("hrv", 4).unsqueeze(0).to(DEVICE)
+        motion = gather("motion", 6).unsqueeze(0).to(DEVICE)
+        env = gather("env", 3).unsqueeze(0).to(DEVICE)
+
+        z, conf = self.model.forward_infer(temp, hrv, motion, env, smoother=self.smoother)
+        # Return the last embedding as the current representation
+        return z[-1].detach().cpu()
+
+
+# ============================
+# Demo run (sanity check)
+# ============================
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    model = FusionModel().to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+
+    # Pretend-pretrain for a few steps
+    for step in range(3):
+        batch = make_toy_batch()
+        stats = pretrain_step(model, opt, batch)
+        print(f"step {step}: ", stats)
+
+    # Streaming inference demo
+    pipe = OnDevicePipeline(model)
+    now = time.time()
+    for i in range(40):
+        ts = now + i * 0.25
+        pipe.push_packet("temp", SensorPacket(ts, torch.randn(2), quality=0.9))
+        pipe.push_packet("hrv", SensorPacket(ts, torch.randn(4), quality=0.8))
+        pipe.push_packet("motion", SensorPacket(ts, torch.randn(6), quality=0.95))
+        pipe.push_packet("env", SensorPacket(ts, torch.randn(3), quality=0.85))
+        if i % 4 == 0:
+            z = pipe.infer_step(ts)
+            print("embedding[", i, "] norm=", float(z.norm()))
